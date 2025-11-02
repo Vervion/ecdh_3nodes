@@ -121,26 +121,29 @@ async fn main() {
             };
 
             // For each peer create a dedicated sender channel and task
+            use tokio::sync::Mutex;
+            use std::sync::Arc;
             let mut sender_txs = Vec::new();
             // Force rekey every 5 seconds
             let rekey = Some(Duration::from_secs(5));
             for peer in &peers {
-                let (tx, rx_main) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                sender_txs.push(tx);
+                let sender = Arc::new(Mutex::new(None));
+                sender_txs.push(sender.clone());
                 let peer_clone = peer.clone();
                 let metrics_clone = metrics.clone();
-                // spawn sender task with connection retry
+                let sender_clone = sender.clone();
                 tokio::spawn(async move {
-                    let mut rx_opt = Some(rx_main);
                     loop {
-                        let rx = rx_opt.take().unwrap();
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                        // Update the sender for broadcaster
+                        {
+                            let mut s = sender_clone.lock().await;
+                            *s = Some(tx);
+                        }
                         match transport::run_sender_from_channel(&peer_clone, rekey, rx, metrics_clone.clone()).await {
                             Ok(_) => break, // exit loop if connection and run succeed
                             Err(e) => {
                                 eprintln!("mesh sender to {peer_clone} failed: {e}, retrying in 2s");
-                                // recreate channel for next attempt
-                                let (_tx, new_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                                rx_opt = Some(new_rx);
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                             }
                         }
@@ -151,9 +154,11 @@ async fn main() {
             // Broadcast captured frames to all sender channels
             tokio::spawn(async move {
                 while let Some(frame) = src_rx.recv().await {
-                    for tx in &sender_txs {
-                        // best-effort: ignore send failures
-                        let _ = tx.send(frame.clone()).await;
+                    for sender in &sender_txs {
+                        let tx_opt = sender.lock().await;
+                        if let Some(tx) = tx_opt.as_ref() {
+                            let _ = tx.send(frame.clone()).await;
+                        }
                     }
                 }
                 eprintln!("mesh capture ended");
