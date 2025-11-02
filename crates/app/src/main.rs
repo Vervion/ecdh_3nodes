@@ -125,14 +125,25 @@ async fn main() {
             // Force rekey every 5 seconds
             let rekey = Some(Duration::from_secs(5));
             for peer in &peers {
-                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                let (tx, rx_main) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                 sender_txs.push(tx);
                 let peer_clone = peer.clone();
                 let metrics_clone = metrics.clone();
-                // spawn sender task
+                // spawn sender task with connection retry
                 tokio::spawn(async move {
-                    if let Err(e) = transport::run_sender_from_channel(&peer_clone, rekey, rx, metrics_clone).await {
-                        eprintln!("mesh sender to {peer_clone} failed: {e}");
+                    let mut rx_opt = Some(rx_main);
+                    loop {
+                        let rx = rx_opt.take().unwrap();
+                        match transport::run_sender_from_channel(&peer_clone, rekey, rx, metrics_clone.clone()).await {
+                            Ok(_) => break, // exit loop if connection and run succeed
+                            Err(e) => {
+                                eprintln!("mesh sender to {peer_clone} failed: {e}, retrying in 2s");
+                                // recreate channel for next attempt
+                                let (_tx, new_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                                rx_opt = Some(new_rx);
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                        }
                     }
                 });
             }
