@@ -1,6 +1,6 @@
 use std::time::Duration;
 use keying::{log_arm_crypto_support, demo_ecdh, demo_rsa};
-use transport::{run_receiver, run_sender};
+// use transport::{run_receiver, run_sender};
 
 fn arg_val(args: &[String], key: &str) -> Option<String> {
     // accepts: --key value  OR  --key=value
@@ -99,7 +99,7 @@ async fn main() {
         if payload == "video" {
             let fps = arg_val(&args, "--fps").and_then(|s| s.parse::<i32>().ok()).unwrap_or(30);
             // start playback pipeline (receives frames via a Sender)
-            let (playback_tx, _pipe) = match video::start_h264_playback(fps) {
+            let (_playback_tx, _pipe) = match video::start_h264_playback(fps) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("mesh error: playback init failed: {e}"); std::process::exit(1); }
             };
@@ -122,8 +122,8 @@ async fn main() {
 
             // For each peer create a dedicated sender channel and task
             let mut sender_txs = Vec::new();
-            // common rekey setting for outgoing senders
-            let rekey = arg_val(&args, "--rekey").and_then(|s| parse_rekey(&s));
+            // Force rekey every 5 seconds
+            let rekey = Some(Duration::from_secs(5));
             for peer in &peers {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                 sender_txs.push(tx);
@@ -148,9 +148,29 @@ async fn main() {
                 eprintln!("mesh capture ended");
             });
 
-            // Start receiver to accept many incoming connections and push frames into playback
-            if let Err(e) = transport::run_receiver_to_channel(&bind, playback_tx, metrics.clone()).await {
-                eprintln!("mesh receiver error: {e}");
+            // Start receiver to accept many incoming connections and spawn a playback pipeline for each
+            use tokio::sync::mpsc;
+            let handler = move |rx: mpsc::Receiver<Vec<u8>>, peer_addr: String| {
+                let fps = arg_val(&args, "--fps").and_then(|s| s.parse::<i32>().ok()).unwrap_or(30);
+                tokio::spawn(async move {
+                    match video::start_h264_playback(fps) {
+                        Ok((tx, _pipe)) => {
+                            let mut rx = rx;
+                            // Forward frames from rx to playback tx
+                            while let Some(frame) = rx.recv().await {
+                                let _ = tx.send(frame).await;
+                            }
+                            eprintln!("[app] playback for {peer_addr} ended");
+                        }
+                        Err(e) => {
+                            eprintln!("mesh error: playback init failed for {peer_addr}: {e}");
+                        }
+                    }
+                })
+            };
+
+            if let Err(e) = transport::run_multi_receiver_to_channel(&bind, metrics.clone(), handler).await {
+                eprintln!("mesh multi-receiver error: {e}");
                 std::process::exit(1);
             }
         } else {
