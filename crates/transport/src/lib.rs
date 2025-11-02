@@ -1,3 +1,141 @@
+/// Multi-connection receiver: for each incoming connection, spawn a handler with a new channel.
+pub async fn run_multi_receiver_to_channel<Handler>(
+    bind: &str,
+    metrics_opt: Option<metrics::Metrics>,
+    handler: Handler,
+) -> anyhow::Result<()>
+where
+    Handler: Fn(tokio::sync::mpsc::Receiver<Vec<u8>>, String) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+{
+    use anyhow::Context;
+    let listener = tokio::net::TcpListener::bind(bind).await.context("bind")?;
+    eprintln!("[recv] listening on {bind} (multi)");
+
+    let handler = std::sync::Arc::new(handler);
+
+    loop {
+        let (mut sock, peer) = listener.accept().await.context("accept")?;
+        let peer_str = peer.to_string();
+        eprintln!("[recv] connection from {peer_str}");
+
+        let metrics_clone = metrics_opt.clone();
+        let handler = handler.clone();
+
+        // Create a new channel for this connection
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        // Spawn the playback handler for this connection
+        let _playback_handle = (handler)(frame_rx, peer_str.clone());
+
+        tokio::spawn(async move {
+            let hs_start = std::time::Instant::now();
+            let (mut _tx_unused, mut rx, shared32, client_pub_len, server_pub_len) = match handshake_server(&mut sock).await.context("handshake_server") {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(m) = &metrics_clone {
+                        let _ = m.record_handshake("ECDH", hs_start.elapsed(), 0, 0, false, Some(format!("{e}")), Some(peer_str.clone()));
+                    }
+                    eprintln!("[recv:{peer_str}] handshake failed: {e}");
+                    return;
+                }
+            };
+            let hs_d = hs_start.elapsed();
+            eprintln!("[recv:{peer_str}] handshake OK");
+            if let Some(m) = &metrics_clone {
+                let bytes_sent = (2 + server_pub_len + 8) as u64;
+                let bytes_received = (2 + client_pub_len + 8) as u64;
+                let _ = m.record_handshake("ECDH", hs_d, bytes_sent, bytes_received, true, None, Some(peer_str.clone()));
+            }
+
+            // spawn periodic system snapshot and latency summary if requested
+            if let Some(m) = metrics_clone.clone() {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let _ = m.record_system_snapshot();
+                        let _ = m.write_latency_summary();
+                    }
+                });
+            }
+
+            // throughput counters
+            let mut throughput_bytes: u64 = 0;
+            let mut throughput_frames: u64 = 0;
+            let mut throughput_last = std::time::Instant::now();
+
+            loop {
+                let mut hdr=[0u8;12];
+                if let Err(e)=sock.read_exact(&mut hdr).await { eprintln!("[recv:{peer_str}] closed: {e}"); break; }
+                let seq = u64::from_be_bytes(hdr[..8].try_into().unwrap()) as u32;
+                let ct_len = u32::from_be_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                let mut ct = vec![0u8; ct_len];
+                if let Err(e) = sock.read_exact(&mut ct).await { eprintln!("[recv:{peer_str}] read error: {e}"); break; }
+                // measure rekey handling time for rekey control frames (decrypt + hkdf + rotate)
+                let handling_start = std::time::Instant::now();
+                let pt = match rx.decrypt(seq, &ct, &aad(seq)) {
+                    Ok(p) => { p }
+                    Err(e) => {
+                        eprintln!("[recv:{peer_str}] decrypt error: {e}");
+                        if let Some(m) = &metrics_clone {
+                            let _ = m.record_errors(0, 1, 0);
+                        }
+                        continue;
+                    }
+                };
+
+                if seq == REKEY_SEQ {
+                    if pt.len()!=REKEY_PT_LEN { eprintln!("[recv:{peer_str}] bad rekey payload length"); continue; }
+                    // extract fields
+                    let mut salt=[0u8;16]; salt.copy_from_slice(&pt[0..16]);
+                    let mut c2s=[0u8;8];   c2s.copy_from_slice(&pt[16..24]);
+                    let mut s2c=[0u8;8];   s2c.copy_from_slice(&pt[24..32]);
+
+                    // Server role: new RX is k_c2s with c2s_base
+                    let (k_c2s, _k_s2c) = hkdf_pair_from_shared(&shared32, &salt);
+                    rx = AesGcmCtx::new(k_c2s, c2s);
+
+                    // record total handling duration for REKEY
+                    if let Some(m) = &metrics_clone {
+                        let bytes_received = (12 + ct.len()) as u64; // header + ciphertext
+                        let handling_d = handling_start.elapsed();
+                        let _ = m.record_handshake("REKEY", handling_d, 0, bytes_received, true, None, Some(peer_str.clone()));
+                    }
+                    eprintln!("[recv:{peer_str}] rekey applied");
+                    // fallthrough to continue processing normal frames if any
+                }
+
+                // normal data frame: compute latency from 8B timestamp, strip it and forward H.264 AU
+                if pt.len() >= 8 {
+                    let mut tsb = [0u8;8]; tsb.copy_from_slice(&pt[0..8]);
+                    let sender_ns = u64::from_be_bytes(tsb);
+                    let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+                    if now_ns >= sender_ns {
+                        let latency_ms = (now_ns - sender_ns) as f64 / 1e6;
+                        if let Some(m) = &metrics_clone {
+                            let _ = m.record_frame_latency_ms(latency_ms);
+                        }
+                    }
+                    // throughput accounting
+                    throughput_frames += 1;
+                    throughput_bytes += (ct.len() + 12) as u64;
+                    if let Some(m) = &metrics_clone {
+                        let now = std::time::Instant::now();
+                        let dur = now.duration_since(throughput_last).as_secs_f64();
+                        if dur >= 5.0 {
+                            let goodput_mbps = (throughput_bytes as f64 * 8.0) / (dur * 1e6);
+                            let _ = m.record_throughput(dur, goodput_mbps, throughput_frames);
+                            throughput_last = now;
+                            throughput_bytes = 0;
+                            throughput_frames = 0;
+                        }
+                    }
+                }
+                let h264 = if pt.len()>=8 { pt[8..].to_vec() } else { Vec::new() };
+                if frame_tx.send(h264).await.is_err() { break; }
+            }
+            eprintln!("[recv:{peer_str}] connection handler exiting");
+        });
+    }
+}
 use anyhow::{anyhow, Context, Result};
 use hkdf::Hkdf;
 use p256::ecdh::EphemeralSecret;
